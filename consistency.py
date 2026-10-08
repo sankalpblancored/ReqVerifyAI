@@ -1,168 +1,130 @@
+import re
+
+
 def check_consistency(requirements):
+
     """
-    Detect simple logical contradictions between
-    software requirements.
+    Detect simple potential contradictions
+    between requirement statements.
 
-    Returns a list of explainable consistency issues.
+    This is a lightweight rule-based check.
     """
 
-    lines = [
-        line.strip()
-        for line in requirements.split("\n")
-        if line.strip()
-    ]
+    if isinstance(
+        requirements,
+        str
+    ):
 
-    normalized = [
-        line.lower()
-        for line in lines
-    ]
+        from requirements import (
+            extract_requirements
+        )
+
+        requirements = (
+            extract_requirements(
+                requirements
+            )
+        )
 
     issues = []
 
+    positive = []
 
-    # =====================================================
-    # LOGIN / DASHBOARD CONTRADICTION
-    # =====================================================
+    negative = []
 
-    login_required_index = None
-    dashboard_bypass_index = None
+    for requirement in requirements or []:
 
+        text = requirement.get(
+            "description",
+            ""
+        ).strip()
 
-    for index, line in enumerate(normalized):
+        if not text:
+            continue
 
-        if (
-            "successful login" in line
-            and "dashboard" in line
-        ) or (
-            "after login" in line
-            and "dashboard" in line
-        ) or (
-            "after authentication" in line
-            and "dashboard" in line
+        low = text.lower()
+
+        # Positive permission/requirement.
+        if re.search(
+            r"\b("
+            r"shall|must|can|may|"
+            r"should|will|allows?"
+            r")\b",
+            low,
         ):
 
-            login_required_index = index
-
-
-        if (
-            "dashboard" in line
-            and (
-                "without logging in" in line
-                or "without login" in line
-                or "without authentication" in line
-                or "without signing in" in line
-                or "without sign in" in line
+            positive.append(
+                requirement
             )
+
+        # Negative restriction.
+        if re.search(
+            r"\b("
+            r"shall not|must not|"
+            r"cannot|can not|"
+            r"may not|should not|"
+            r"never|prohibits?"
+            r")\b",
+            low,
         ):
 
-            dashboard_bypass_index = index
+            negative.append(
+                requirement
+            )
 
+    for positive_req in positive:
 
-    if (
-        login_required_index is not None
-        and dashboard_bypass_index is not None
-    ):
-
-        issues.append(
-            "Contradiction detected between "
-            f"Requirement {login_required_index + 1} "
-            f"and Requirement {dashboard_bypass_index + 1}: "
-            "one requirement indicates that dashboard access "
-            "follows successful authentication, while another "
-            "allows dashboard access without authentication."
+        positive_words = set(
+            re.findall(
+                r"[a-z]{4,}",
+                positive_req[
+                    "description"
+                ].lower()
+            )
         )
 
+        for negative_req in negative:
 
-    # =====================================================
-    # PAYMENT SUCCESS / PAYMENT FAILURE CONTRADICTION
-    # =====================================================
+            negative_words = set(
+                re.findall(
+                    r"[a-z]{4,}",
+                    negative_req[
+                        "description"
+                    ].lower()
+                )
+            )
 
-    payment_success_index = None
-    payment_failure_index = None
+            overlap = (
+                positive_words
+                & negative_words
+            )
 
+            if len(overlap) >= 3:
 
-    for index, line in enumerate(normalized):
+                issues.append({
 
-        if (
-            "payment succeeds" in line
-            or "payment is successful" in line
-            or "successful payment" in line
-            or "payment successful" in line
-        ):
+                    "type":
+                        "Potential contradiction",
 
-            payment_success_index = index
+                    "message":
+                        (
+                            f"{positive_req['id']} "
+                            f"and "
+                            f"{negative_req['id']} "
+                            "may express "
+                            "conflicting behavior."
+                        ),
 
+                    "requirements": [
+                        positive_req["id"],
+                        negative_req["id"],
+                    ],
 
-        if (
-            "payment always fails" in line
-            or "payment always unsuccessful" in line
-            or "payment can never succeed" in line
-            or "payment never succeeds" in line
-        ):
-
-            payment_failure_index = index
-
-
-    if (
-        payment_success_index is not None
-        and payment_failure_index is not None
-    ):
-
-        issues.append(
-            "Potential payment contradiction between "
-            f"Requirement {payment_success_index + 1} "
-            f"and Requirement {payment_failure_index + 1}: "
-            "one requirement describes successful payment "
-            "while another states that payment cannot succeed."
-        )
-
-
-    # =====================================================
-    # ORDER CONFIRMATION CONTRADICTION
-    # =====================================================
-
-    order_confirmed_index = None
-    order_not_confirmed_index = None
-
-
-    for index, line in enumerate(normalized):
-
-        if (
-            "order is confirmed" in line
-            or "order confirmed" in line
-            or "order is placed" in line
-            or "order placed" in line
-        ):
-
-            order_confirmed_index = index
-
-
-        if (
-            "order is not confirmed" in line
-            or "order not confirmed" in line
-            or "order cannot be confirmed" in line
-            or "order is never confirmed" in line
-        ):
-
-            order_not_confirmed_index = index
-
-
-    if (
-        order_confirmed_index is not None
-        and order_not_confirmed_index is not None
-    ):
-
-        issues.append(
-            "Potential order-confirmation contradiction between "
-            f"Requirement {order_confirmed_index + 1} "
-            f"and Requirement {order_not_confirmed_index + 1}: "
-            "the requirements provide conflicting conditions "
-            "for order confirmation."
-        )
-
-
-    # =====================================================
-    # RETURN RESULTS
-    # =====================================================
+                    "evidence":
+                        (
+                            f"{positive_req['description']} "
+                            "/ "
+                            f"{negative_req['description']}"
+                        ),
+                })
 
     return issues

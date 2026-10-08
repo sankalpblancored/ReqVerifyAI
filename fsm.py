@@ -1,3 +1,6 @@
+from collections import deque
+
+
 class FiniteStateMachine:
 
     def __init__(self):
@@ -10,15 +13,18 @@ class FiniteStateMachine:
 
         self.final_states = set()
 
-
-    # =====================================================
-    # STATE MANAGEMENT
-    # =====================================================
+    # ------------------------------------------------------
+    # States
+    # ------------------------------------------------------
 
     def add_state(self, state):
 
         self.states.add(state)
 
+        self.transitions.setdefault(
+            state,
+            []
+        )
 
     def set_start_state(self, state):
 
@@ -26,17 +32,15 @@ class FiniteStateMachine:
 
         self.start_state = state
 
-
     def add_final_state(self, state):
 
         self.add_state(state)
 
         self.final_states.add(state)
 
-
-    # =====================================================
-    # TRANSITIONS
-    # =====================================================
+    # ------------------------------------------------------
+    # Transitions
+    # ------------------------------------------------------
 
     def add_transition(
         self,
@@ -45,25 +49,32 @@ class FiniteStateMachine:
         to_state
     ):
 
-        self.add_state(from_state)
-
-        self.add_state(to_state)
-
-        if from_state not in self.transitions:
-
-            self.transitions[from_state] = []
-
-        self.transitions[from_state].append(
-            (
-                event,
-                to_state
-            )
+        self.add_state(
+            from_state
         )
 
+        self.add_state(
+            to_state
+        )
 
-    # =====================================================
-    # REACHABILITY
-    # =====================================================
+        transition = (
+            event,
+            to_state
+        )
+
+        if transition not in self.transitions[
+            from_state
+        ]:
+
+            self.transitions[
+                from_state
+            ].append(
+                transition
+            )
+
+    # ------------------------------------------------------
+    # Reachability
+    # ------------------------------------------------------
 
     def get_reachable_states(self):
 
@@ -71,163 +82,126 @@ class FiniteStateMachine:
 
             return set()
 
-
-        visited = set()
-
-        stack = [
+        visited = {
             self.start_state
-        ]
+        }
 
+        queue = deque([
+            self.start_state
+        ])
 
-        while stack:
+        while queue:
 
-            current = stack.pop()
+            state = queue.popleft()
 
-
-            if current in visited:
-
-                continue
-
-
-            visited.add(current)
-
-
-            for event, next_state in self.transitions.get(
-                current,
+            for _, next_state in self.transitions.get(
+                state,
                 []
             ):
 
                 if next_state not in visited:
 
-                    stack.append(
+                    visited.add(
                         next_state
                     )
 
+                    queue.append(
+                        next_state
+                    )
 
         return visited
 
-
-    # =====================================================
-    # UNREACHABLE STATES
-    # =====================================================
+    # ------------------------------------------------------
+    # Unreachable
+    # ------------------------------------------------------
 
     def get_unreachable_states(self):
+
+        return (
+            self.states
+            - self.get_reachable_states()
+        )
+
+    # ------------------------------------------------------
+    # Dead ends
+    # ------------------------------------------------------
+
+    def get_dead_end_states(self):
 
         reachable = (
             self.get_reachable_states()
         )
 
-        return self.states - reachable
+        return {
 
+            state
 
-    # =====================================================
-    # DEAD-END STATES
-    # =====================================================
+            for state in reachable
 
-    def get_dead_end_states(self):
-
-        dead_ends = set()
-
-
-        for state in self.states:
-
-            if state not in self.final_states:
-
-                if (
-                    state not in self.transitions
-                    or len(
-                        self.transitions[state]
-                    ) == 0
-                ):
-
-                    dead_ends.add(
-                        state
+            if (
+                state
+                not in self.final_states
+                and len(
+                    self.transitions.get(
+                        state,
+                        []
                     )
+                ) == 0
+            )
+        }
 
+    # ------------------------------------------------------
+    # Sequence validation
+    # ------------------------------------------------------
 
-        return dead_ends
-
-
-    # =====================================================
-    # FSM ACCEPTANCE
-    # =====================================================
-
-    def check_sequence(self, events):
+    def check_sequence(
+        self,
+        events
+    ):
 
         if self.start_state is None:
 
-            return (
-                False,
-                "No start state defined."
-            )
-
+            return False
 
         current_state = (
             self.start_state
         )
 
-
-        # -------------------------------------------------
-        # Process every input event
-        # -------------------------------------------------
-
         for event in events:
 
-            found = False
+            matches = [
 
-
-            for (
-                transition_event,
                 next_state
-            ) in self.transitions.get(
-                current_state,
-                []
-            ):
 
-                if transition_event == event:
+                for transition_event, next_state
 
-                    current_state = (
-                        next_state
-                    )
-
-                    found = True
-
-                    break
-
-
-            # -------------------------------------------------
-            # Invalid transition
-            # -------------------------------------------------
-
-            if not found:
-
-                return (
-                    False,
-                    f"Invalid event '{event}' "
-                    f"from state '{current_state}'."
+                in self.transitions.get(
+                    current_state,
+                    []
                 )
 
+                if transition_event == event
+            ]
 
-        # -------------------------------------------------
-        # Formal acceptance condition
-        # -------------------------------------------------
+            if not matches:
 
-        if current_state in self.final_states:
+                return False
 
-            return (
-                True,
-                f"Accepted. Input sequence reaches "
-                f"final state '{current_state}'."
-            )
-
-
-        # -------------------------------------------------
-        # Valid transitions but non-final state
-        # -------------------------------------------------
+            current_state = matches[0]
 
         return (
-            False,
-            f"Rejected. All transitions were valid, "
-            f"but the sequence ends at non-final state "
-            f"'{current_state}'."
+            current_state
+            in self.final_states
+        )
+
+    # ------------------------------------------------------
+    # Transition count
+    # ------------------------------------------------------
+
+    def get_transition_count(self):
+
+        return sum(
+            len(transitions)
+            for transitions
+            in self.transitions.values()
         )

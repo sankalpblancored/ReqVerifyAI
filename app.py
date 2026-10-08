@@ -1,156 +1,23 @@
-import streamlit as st
-import networkx as nx
-import matplotlib.pyplot as plt
-from pypdf import PdfReader
+import re
+from io import BytesIO
+from zipfile import ZipFile
+from xml.etree import ElementTree as ET
+from collections import deque
 from datetime import datetime
 
-from parser import parse_requirements
+import matplotlib.pyplot as plt
+import networkx as nx
+import streamlit as st
+from pypdf import PdfReader
+
+from requirements import extract_requirements
+from parser import (
+    parse_requirements,
+    infer_final_states,
+)
 from fsm import FiniteStateMachine
 from consistency import check_consistency
-from requirements import extract_requirements
 
-
-def get_sequence_trace(fsm, events):
-    """Return states and transitions visited while executing an event sequence."""
-
-    if fsm.start_state is None:
-        return [], []
-
-    states = [fsm.start_state]
-    visited_transitions = []
-    current_state = fsm.start_state
-
-    for event in events:
-        found = False
-
-        for transition_event, next_state in fsm.transitions.get(
-            current_state, []
-        ):
-            if transition_event == event:
-                visited_transitions.append(
-                    (current_state, event, next_state)
-                )
-                current_state = next_state
-                states.append(current_state)
-                found = True
-                break
-
-        if not found:
-            break
-
-    return states, visited_transitions
-
-def build_requirement_traceability(
-    extracted_requirements,
-    transitions
-):
-    """Map each functional requirement to only the FSM transitions
-    that are directly represented by that requirement."""
-
-    traceability = []
-
-    for index, requirement in enumerate(
-        extracted_requirements,
-        start=1
-    ):
-        description = requirement["description"]
-        text = description.lower().strip()
-        matched_transitions = []
-
-        for from_state, event, to_state in transitions:
-            match = False
-
-            # FR describing the login action itself.
-            if event == "login":
-                match = any(phrase in text for phrase in [
-                    "user logs in",
-                    "user login",
-                    "logs in",
-                    "signs in",
-                    "user signs in",
-                    "authenticate",
-                    "user authenticates"
-                ])
-
-            # Successful login leads to the dashboard.
-            elif event == "success" and to_state == "DASHBOARD":
-                match = (
-                    ("successful login" in text or
-                     "successful authentication" in text or
-                     "after login" in text or
-                     "after successful login" in text)
-                    and "dashboard" in text
-                )
-
-            # Adding an item/product to the cart.
-            elif event == "add_item":
-                match = (
-                    ("add" in text and "cart" in text)
-                    or "add product" in text
-                    or "add item" in text
-                )
-
-            # Moving from cart to payment/checkout.
-            elif event == "checkout":
-                match = (
-                    "proceeds to payment" in text
-                    or "proceed to payment" in text
-                    or "proceeds for payment" in text
-                    or "checkout" in text
-                    or "checks out" in text
-                )
-
-            # Successful payment confirms the order.
-            elif event == "success" and to_state == "ORDER_CONFIRMED":
-                match = (
-                    "payment succeeds" in text
-                    or "payment is successful" in text
-                    or "successful payment" in text
-                    or ("payment" in text and "order is confirmed" in text)
-                    or ("payment" in text and "order confirmed" in text)
-                )
-
-            # Failed payment moves to retry.
-            elif event == "failure":
-                match = (
-                    "payment fails" in text
-                    or "payment failed" in text
-                    or "payment failure" in text
-                    or "payment unsuccessful" in text
-                )
-
-            # Retry transition.
-            elif event == "retry":
-                match = (
-                    "retry payment" in text
-                    or "retry" in text
-                    or "try again" in text
-                )
-
-            # Optional cancellation transition.
-            elif event == "cancel":
-                match = (
-                    "cancel payment" in text
-                    or "payment is cancelled" in text
-                    or "payment is canceled" in text
-                    or "order is cancelled" in text
-                    or "order is canceled" in text
-                )
-
-            if match:
-                transition_text = (
-                    f"{from_state} --{event}--> {to_state}"
-                )
-                if transition_text not in matched_transitions:
-                    matched_transitions.append(transition_text)
-
-        traceability.append({
-            "id": f"FR{index}",
-            "requirement": description,
-            "transitions": matched_transitions
-        })
-
-    return traceability
 
 # =========================================================
 # PAGE CONFIGURATION
@@ -159,57 +26,621 @@ def build_requirement_traceability(
 st.set_page_config(
     page_title="ReqVerify AI",
     page_icon="🔍",
-    layout="wide"
+    layout="wide",
 )
 
 
 # =========================================================
-# CUSTOM UI
+# DOCUMENT READING
 # =========================================================
 
-st.markdown(
+def read_docx(file_bytes):
+
     """
-    <style>
+    Extract paragraphs and table cells from DOCX
+    without requiring an additional DOCX library.
+    """
 
-    .main-title {
-        font-size: 42px;
-        font-weight: 700;
-        margin-bottom: 0px;
+    text_parts = []
+
+    with ZipFile(
+        BytesIO(file_bytes)
+    ) as archive:
+
+        xml_data = archive.read(
+            "word/document.xml"
+        )
+
+    root = ET.fromstring(
+        xml_data
+    )
+
+    namespace = {
+        "w":
+            "http://schemas.openxmlformats.org/"
+            "wordprocessingml/2006/main"
     }
 
-    .subtitle {
-        font-size: 18px;
-        color: #666666;
-        margin-bottom: 25px;
-    }
+    # Paragraphs.
+    for paragraph in root.findall(
+        ".//w:p",
+        namespace
+    ):
 
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+        words = []
+
+        for node in paragraph.findall(
+            ".//w:t",
+            namespace
+        ):
+
+            if node.text:
+                words.append(
+                    node.text
+                )
+
+        line = " ".join(words).strip()
+
+        if line:
+            text_parts.append(line)
+
+    # Tables.
+    for table in root.findall(
+        ".//w:tbl",
+        namespace
+    ):
+
+        for row in table.findall(
+            "./w:tr",
+            namespace
+        ):
+
+            cells = []
+
+            for cell in row.findall(
+                "./w:tc",
+                namespace
+            ):
+
+                cell_text = " ".join(
+                    node.text
+                    for node in cell.findall(
+                        ".//w:t",
+                        namespace
+                    )
+                    if node.text
+                )
+
+                cell_text = (
+                    re.sub(
+                        r"\s+",
+                        " ",
+                        cell_text
+                    )
+                    .strip()
+                )
+
+                if cell_text:
+                    cells.append(
+                        cell_text
+                    )
+
+            if cells:
+
+                text_parts.append(
+                    " | ".join(cells)
+                )
+
+    return "\n".join(
+        text_parts
+    )
+
+
+def read_uploaded_file(uploaded_file):
+
+    filename = (
+        uploaded_file.name.lower()
+    )
+
+    data = uploaded_file.read()
+
+    # ------------------------------------------------------
+    # PDF
+    # ------------------------------------------------------
+
+    if filename.endswith(".pdf"):
+
+        reader = PdfReader(
+            BytesIO(data)
+        )
+
+        pages = []
+
+        for page in reader.pages:
+
+            page_text = (
+                page.extract_text()
+            )
+
+            if page_text:
+
+                pages.append(
+                    page_text
+                )
+
+        return "\n".join(
+            pages
+        )
+
+    # ------------------------------------------------------
+    # DOCX
+    # ------------------------------------------------------
+
+    if filename.endswith(".docx"):
+
+        return read_docx(
+            data
+        )
+
+    # ------------------------------------------------------
+    # TXT / MD / CSV-like text
+    # ------------------------------------------------------
+
+    return data.decode(
+        "utf-8",
+        errors="ignore"
+    )
 
 
 # =========================================================
-# TITLE
+# TRACEABILITY
 # =========================================================
 
-st.markdown(
-    '<div class="main-title">🔍 ReqVerify AI</div>',
-    unsafe_allow_html=True
+def build_workflow(extracted_requirements):
+    """
+    Build a domain-independent workflow from extracted requirements.
+
+    The workflow is produced by the generic parser. No shopping,
+    hospital, payment, login, or other domain-specific states are
+    hardcoded here.
+    """
+    transitions = parse_requirements(extracted_requirements)
+
+    traceability = []
+
+    functional_requirements = [
+        requirement
+        for requirement in extracted_requirements
+        if requirement.get("type") != "Non-Functional"
+    ]
+
+    for index, requirement in enumerate(functional_requirements):
+
+        requirement_id = requirement.get(
+            "id",
+            f"FR{index + 1}"
+        )
+
+        description = requirement.get(
+            "description",
+            ""
+        )
+
+        if index < len(transitions):
+            source, event, target = transitions[index]
+        else:
+            source, event, target = "", "", ""
+
+        traceability.append({
+            "id": requirement_id,
+            "title": requirement.get("title", ""),
+            "description": description,
+            "transition": (
+                source,
+                event,
+                target
+            ) if source else None,
+            "status": (
+                "Mapped to FSM"
+                if source
+                else "Not converted to FSM"
+            ),
+        })
+
+    return (
+        transitions,
+        traceability
+    )
+
+
+# =========================================================
+# SEQUENCE UTILITIES
+# =========================================================
+
+def get_valid_sequence(fsm):
+
+    if (
+        fsm.start_state is None
+        or not fsm.final_states
+    ):
+
+        return []
+
+    queue = deque()
+
+    queue.append(
+        (
+            fsm.start_state,
+            []
+        )
+    )
+
+    visited = {
+        fsm.start_state
+    }
+
+    while queue:
+
+        state, events = (
+            queue.popleft()
+        )
+
+        if state in fsm.final_states:
+
+            return events
+
+        for event, next_state in (
+            fsm.transitions.get(
+                state,
+                []
+            )
+        ):
+
+            if next_state not in visited:
+
+                visited.add(
+                    next_state
+                )
+
+                queue.append(
+                    (
+                        next_state,
+                        events + [event]
+                    )
+                )
+
+    return []
+
+
+def get_sequence_trace(
+    fsm,
+    events
+):
+
+    states = []
+
+    transitions = []
+
+    if fsm.start_state is None:
+
+        return states, transitions
+
+    current = (
+        fsm.start_state
+    )
+
+    states.append(
+        current
+    )
+
+    for event in events:
+
+        found = False
+
+        for transition_event, next_state in (
+            fsm.transitions.get(
+                current,
+                []
+            )
+        ):
+
+            if (
+                transition_event
+                == event
+            ):
+
+                transitions.append(
+                    (
+                        current,
+                        event,
+                        next_state,
+                    )
+                )
+
+                current = next_state
+
+                states.append(
+                    current
+                )
+
+                found = True
+
+                break
+
+        if not found:
+
+            break
+
+    return (
+        states,
+        transitions
+    )
+
+
+# =========================================================
+# VISUALIZATION
+# =========================================================
+
+def draw_fsm(fsm):
+
+    graph = nx.DiGraph()
+
+    for state in fsm.states:
+
+        graph.add_node(
+            state
+        )
+
+    for source in fsm.transitions:
+
+        for event, target in (
+            fsm.transitions[source]
+        ):
+
+            graph.add_edge(
+                source,
+                target,
+                label=event
+            )
+
+    if not graph.nodes:
+
+        st.info(
+            "No states available."
+        )
+
+        return
+
+    figure, axis = plt.subplots(
+        figsize=(
+            14,
+            max(
+                6,
+                len(graph.nodes) * 0.6
+            )
+        )
+    )
+
+    positions = nx.spring_layout(
+        graph,
+        seed=42,
+        k=1.8,
+    )
+
+    nx.draw_networkx_nodes(
+        graph,
+        positions,
+        node_size=2500,
+        ax=axis,
+    )
+
+    nx.draw_networkx_labels(
+        graph,
+        positions,
+        font_size=9,
+        ax=axis,
+    )
+
+    nx.draw_networkx_edges(
+        graph,
+        positions,
+        arrows=True,
+        arrowsize=20,
+        ax=axis,
+    )
+
+    labels = nx.get_edge_attributes(
+        graph,
+        "label"
+    )
+
+    nx.draw_networkx_edge_labels(
+        graph,
+        positions,
+        edge_labels=labels,
+        font_size=8,
+        ax=axis,
+    )
+
+    axis.set_title(
+        "Generated Finite State Machine"
+    )
+
+    axis.axis("off")
+
+    st.pyplot(
+        figure,
+        clear_figure=True
+    )
+
+
+# =========================================================
+# REPORT
+# =========================================================
+
+def build_report(
+    extracted_requirements,
+    fsm,
+    unreachable,
+    dead_ends,
+    consistency_issues,
+    traceability,
+):
+
+    lines = []
+
+    lines.append(
+        "ReqVerify AI - Verification Report"
+    )
+
+    lines.append(
+        "=" * 50
+    )
+
+    lines.append(
+        f"Generated: "
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    lines.append("")
+
+    lines.append(
+        "REQUIREMENTS"
+    )
+
+    lines.append(
+        "-" * 50
+    )
+
+    for requirement in (
+        extracted_requirements
+    ):
+
+        lines.append(
+            f"{requirement['id']} | "
+            f"{requirement['type']} | "
+            f"{requirement['title']}"
+        )
+
+        lines.append(
+            f"  {requirement['description']}"
+        )
+
+    lines.append("")
+
+    lines.append(
+        "FSM"
+    )
+
+    lines.append(
+        "-" * 50
+    )
+
+    lines.append(
+        f"States: {len(fsm.states)}"
+    )
+
+    lines.append(
+        f"Transitions: "
+        f"{fsm.get_transition_count()}"
+    )
+
+    lines.append(
+        f"Start state: "
+        f"{fsm.start_state}"
+    )
+
+    lines.append(
+        f"Final states: "
+        f"{', '.join(sorted(fsm.final_states))}"
+    )
+
+    lines.append("")
+
+    for source in sorted(
+        fsm.transitions
+    ):
+
+        for event, target in (
+            fsm.transitions[source]
+        ):
+
+            lines.append(
+                f"{source} "
+                f"--{event}--> "
+                f"{target}"
+            )
+
+    lines.append("")
+
+    lines.append(
+        "VERIFICATION"
+    )
+
+    lines.append(
+        "-" * 50
+    )
+
+    lines.append(
+        f"Unreachable states: "
+        f"{len(unreachable)}"
+    )
+
+    for state in sorted(
+        unreachable
+    ):
+
+        lines.append(
+            f"  - {state}"
+        )
+
+    lines.append(
+        f"Dead-end states: "
+        f"{len(dead_ends)}"
+    )
+
+    for state in sorted(
+        dead_ends
+    ):
+
+        lines.append(
+            f"  - {state}"
+        )
+
+    lines.append(
+        f"Consistency issues: "
+        f"{len(consistency_issues)}"
+    )
+
+    for issue in consistency_issues:
+
+        lines.append(
+            f"  - {issue['message']}"
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+# =========================================================
+# PAGE
+# =========================================================
+
+st.title(
+    "🔍 ReqVerify AI"
 )
 
-st.markdown(
-    '<div class="subtitle">'
-    'Intelligent Software Requirement Consistency '
-    'and Workflow Verification System'
-    '</div>',
-    unsafe_allow_html=True
+st.subheader(
+    "Intelligent Software Requirement "
+    "Consistency and Workflow Verification"
 )
 
 st.write(
-    "ReqVerify AI analyzes software requirements, "
-    "extracts workflows, models them as Finite State "
-    "Machines and performs formal verification."
+    "Upload an SRS document or enter requirements. "
+    "ReqVerify AI extracts requirements, identifies "
+    "workflow relationships, builds a finite state "
+    "machine and performs structural verification."
 )
 
 
@@ -217,193 +648,279 @@ st.write(
 # INPUT
 # =========================================================
 
-st.header("Software Requirement Input")
-
-demo_mode = st.checkbox(
-    "Enable verification test case",
-    value=False
+col1, col2 = st.columns(
+    [2, 1]
 )
 
-st.caption(
-    "This option intentionally introduces workflow defects "
-    "to demonstrate the verification capabilities."
-)
+with col1:
+
+    uploaded_file = st.file_uploader(
+        "Upload SRS Document",
+        type=[
+            "pdf",
+            "docx",
+            "txt",
+            "md",
+        ],
+    )
+
+with col2:
+
+    demo_mode = st.checkbox(
+        "Enable verification test case",
+        value=False,
+    )
+
+    st.caption(
+        "Adds generic artificial defects "
+        "to demonstrate verification."
+    )
 
 
-default_requirements = """User logs in.
-After successful login, dashboard is displayed.
-User can add products to cart.
-User proceeds to payment.
-If payment succeeds, order is confirmed.
-If payment fails, user can retry payment."""
+default_requirements = """1. User Login
+The user logs in to the system.
 
+2. Dashboard
+After successful login, the dashboard is displayed.
 
-uploaded_file = st.file_uploader(
-    "Upload SRS Document",
-    type=["txt", "pdf"]
-)
+3. Shopping Cart
+The user can add products to the cart.
+
+4. Payment
+The user proceeds to payment.
+
+5. Order Confirmation
+If payment succeeds, the order is confirmed.
+
+6. Payment Failure
+If payment fails, the user can retry payment.
+"""
 
 
 if uploaded_file is not None:
 
-    if uploaded_file.name.lower().endswith(".pdf"):
+    try:
 
-        reader = PdfReader(uploaded_file)
-
-        pages = []
-
-        for page in reader.pages:
-
-            text = page.extract_text()
-
-            if text:
-                pages.append(text)
-
-        uploaded_text = "\n".join(pages)
-
-    else:
-
-        uploaded_text = uploaded_file.read().decode(
-            "utf-8",
-            errors="ignore"
+        uploaded_text = (
+            read_uploaded_file(
+                uploaded_file
+            )
         )
 
-    requirements = st.text_area(
-        "Extracted SRS Content",
-        value=uploaded_text,
-        height=250
-    )
-
-else:
-
-    requirements = st.text_area(
-        "Enter Software Requirements",
-        height=220,
-        value=default_requirements
-    )
-
-
-# =========================================================
-# ANALYSIS
-# =========================================================
-
-if st.button(
-    "🔍 Analyze Requirements",
-    type="primary"
-):
-
-    # =====================================================
-    # 1. REQUIREMENT EXTRACTION
-    # =====================================================
-
-    extracted_requirements = extract_requirements(
-        requirements
-    )
-
-
-    # =====================================================
-    # 2. WORKFLOW PARSING
-    # =====================================================
-
-    transitions = parse_requirements(
-        requirements
-    )
-
-
-    if not transitions:
+    except Exception as error:
 
         st.error(
-            "No workflow could be extracted from "
-            "the supplied requirements."
+            "Unable to read the uploaded "
+            f"document: {error}"
         )
 
         st.stop()
 
+else:
 
-    # =====================================================
-    # 3. FSM CONSTRUCTION
-    # =====================================================
-
-    fsm = FiniteStateMachine()
-
-    fsm.set_start_state("START")
-
-
-    for from_state, event, to_state in transitions:
-
-        fsm.add_transition(
-            from_state,
-            event,
-            to_state
-        )
-
-
-    # =====================================================
-    # 4. FINAL STATE
-    # =====================================================
-
-    if "ORDER_CONFIRMED" in fsm.states:
-
-        fsm.add_final_state(
-            "ORDER_CONFIRMED"
-        )
-
-    if "ORDER_CANCELLED" in fsm.states:
-
-        fsm.add_final_state(
-            "ORDER_CANCELLED"
-        )
-
-
-    # =====================================================
-    # 5. FAULT INJECTION FOR DEMONSTRATION
-    # =====================================================
-
-    if demo_mode:
-
-        # Intentionally unreachable state
-        fsm.add_state(
-            "REFUND_APPROVED"
-        )
-
-        # Intentionally reachable dead-end state
-        fsm.add_transition(
-            "PAYMENT",
-            "processing",
-            "PROCESSING"
-        )
-
-
-    # =====================================================
-    # IMPORTANT:
-    # BUILD ACTUAL FSM TRANSITION LIST
-    # =====================================================
-
-    actual_transitions = []
-
-    for from_state in fsm.transitions:
-
-        for event, to_state in fsm.transitions[
-            from_state
-        ]:
-
-            actual_transitions.append(
-                (
-                    from_state,
-                    event,
-                    to_state
-                )
-            )
-            
-    traceability = build_requirement_traceability(
-        extracted_requirements,
-        actual_transitions
+    uploaded_text = (
+        default_requirements
     )
 
 
-    # =====================================================
-    # 6. FORMAL VERIFICATION
-    # =====================================================
+requirements_text = st.text_area(
+    "SRS Content",
+    value=uploaded_text,
+    height=260,
+)
+
+
+# =========================================================
+# ANALYZE
+# =========================================================
+
+if st.button(
+    "🔍 Analyze Requirements",
+    type="primary",
+):
+
+    # ------------------------------------------------------
+    # 1. REQUIREMENT EXTRACTION
+    # ------------------------------------------------------
+
+    extracted_requirements = (
+        extract_requirements(
+            requirements_text
+        )
+    )
+
+    if not extracted_requirements:
+
+        st.error(
+            "No requirements could be extracted."
+        )
+
+        st.stop()
+
+    st.header(
+        "1. Extracted Requirements"
+    )
+
+    for requirement in (
+        extracted_requirements
+    ):
+
+        badge = (
+            "Functional"
+            if requirement["type"]
+            == "Functional"
+            else "Non-Functional"
+        )
+
+        with st.expander(
+            f"{requirement['id']} — "
+            f"{requirement['title']} "
+            f"({badge})"
+        ):
+
+            st.write(
+                requirement[
+                    "description"
+                ]
+            )
+
+            if requirement[
+                "action"
+            ]:
+
+                st.caption(
+                    "Action: "
+                    + requirement[
+                        "action"
+                    ]
+                )
+
+            if requirement[
+                "condition"
+            ]:
+
+                st.caption(
+                    "Condition: "
+                    + requirement[
+                        "condition"
+                    ]
+                )
+
+            if requirement[
+                "outcome"
+            ]:
+
+                st.caption(
+                    "Outcome: "
+                    + requirement[
+                        "outcome"
+                    ]
+                )
+
+    # ------------------------------------------------------
+    # 2. WORKFLOW
+    # ------------------------------------------------------
+
+    (
+        transitions,
+        traceability
+    ) = build_workflow(
+        extracted_requirements
+    )
+
+    if not transitions:
+
+        st.warning(
+            "Requirements were extracted, "
+            "but no workflow-oriented "
+            "functional relationships "
+            "could be converted into an FSM."
+        )
+
+        st.stop()
+
+    # ------------------------------------------------------
+    # 3. FSM
+    # ------------------------------------------------------
+
+    fsm = FiniteStateMachine()
+
+    fsm.set_start_state(
+        "START"
+    )
+
+    for (
+        source,
+        event,
+        target
+    ) in transitions:
+
+        fsm.add_transition(
+            source,
+            event,
+            target
+        )
+
+    # ------------------------------------------------------
+    # 4. FINAL STATES
+    # ------------------------------------------------------
+
+    final_states = (
+        infer_final_states(
+            extracted_requirements,
+            transitions,
+        )
+    )
+
+    for state in final_states:
+
+        fsm.add_final_state(
+            state
+        )
+
+    # ------------------------------------------------------
+    # 5. DEMONSTRATION DEFECTS
+    # ------------------------------------------------------
+
+    if demo_mode:
+
+        # Generic unreachable state.
+        fsm.add_state(
+            "VERIFICATION_UNREACHABLE"
+        )
+
+        # Choose a reachable state to attach
+        # an artificial dead-end branch.
+        reachable_states = (
+            fsm.get_reachable_states()
+        )
+
+        candidate = None
+
+        for state in reachable_states:
+
+            if (
+                state not in fsm.final_states
+            ):
+
+                candidate = state
+                break
+
+        if candidate is None:
+
+            candidate = (
+                fsm.start_state
+            )
+
+        fsm.add_transition(
+            candidate,
+            "verification_test",
+            "VERIFICATION_DEAD_END",
+        )
+
+    # ------------------------------------------------------
+    # 6. VERIFICATION
+    # ------------------------------------------------------
 
     reachable = (
         fsm.get_reachable_states()
@@ -417,1664 +934,309 @@ if st.button(
         fsm.get_dead_end_states()
     )
 
-
-    # =====================================================
-    # 7. CONSISTENCY CHECK
-    # =====================================================
-
     consistency_issues = (
         check_consistency(
-            requirements
+            extracted_requirements
         )
     )
 
+    # ------------------------------------------------------
+    # 7. METRICS
+    # ------------------------------------------------------
 
-    # =====================================================
-    # 8. ISSUE COUNT
-    # =====================================================
-
-    total_issues = (
-        len(unreachable)
-        + len(dead_ends)
-        + len(consistency_issues)
+    st.header(
+        "2. FSM Summary"
     )
 
+    metric1, metric2, metric3, metric4 = (
+        st.columns(4)
+    )
 
-    # =====================================================
-    # 9. RECOMMENDATIONS
-    # =====================================================
+    metric1.metric(
+        "Requirements",
+        len(extracted_requirements),
+    )
 
-    recommendations = []
+    metric2.metric(
+        "States",
+        len(fsm.states),
+    )
 
+    metric3.metric(
+        "Transitions",
+        fsm.get_transition_count(),
+    )
 
-    for state in sorted(unreachable):
-
-        recommendations.append(
-            f"Review state '{state}'. "
-            "It cannot be reached from the START state. "
-            "Add an appropriate transition or remove "
-            "the state if it is not part of the intended workflow."
-        )
-
-
-    for state in sorted(dead_ends):
-
-        if state in fsm.final_states:
-            continue
-
-        recommendations.append(
-            f"Review state '{state}'. "
-            "It is a dead-end state without an outgoing "
-            "transition. Define the next valid workflow transition."
-        )
-
-
-    for issue in consistency_issues:
-
-        recommendations.append(
-            "Resolve the conflicting requirements: "
-            + issue
-        )
-
-
-    # =====================================================
-    # 10. AUTOMATIC SEQUENCE TESTS
-    # =====================================================
-
-    test_cases = [
-
+    metric4.metric(
+        "Verification Issues",
         (
-            "Valid Login-to-Order Flow",
-            [
-                "login",
-                "success",
-                "add_item",
-                "checkout",
-                "success"
-            ],
-            True
+            len(unreachable)
+            + len(dead_ends)
+            + len(consistency_issues)
         ),
+    )
 
-        (
-            "Valid Payment Retry Flow",
-            [
-                "login",
-                "success",
-                "add_item",
-                "checkout",
-                "failure",
-                "retry",
-                "success"
-            ],
-            True
-        ),
+    # ------------------------------------------------------
+    # 8. TRANSITIONS
+    # ------------------------------------------------------
 
-        (
-            "Payment Cancellation Not Defined",
-            [
-                "login",
-                "success",
-                "add_item",
-                "checkout",
-                "cancel"
-            ],
-            False
-        ),
+    st.subheader(
+        "Generated Workflow"
+    )
 
-        (
-            "Invalid Checkout Before Login",
-            [
-                "checkout"
-            ],
-            False
-        ),
+    for (
+        source,
+        event,
+        target
+    ) in transitions:
 
-        (
-            "Invalid Payment Before Cart",
-            [
-                "login",
-                "success",
-                "checkout"
-            ],
-            False
-        ),
-
-        (
-            "Invalid Unknown Event",
-            [
-                "login",
-                "logout"
-            ],
-            False
+        st.write(
+            f"**{source}** "
+            f"→ `{event}` → "
+            f"**{target}**"
         )
 
-    ]
-
-
-    sequence_results = []
-
-
-    for test_name, events, expected_valid in test_cases:
-
-        is_valid, message = (
-            fsm.check_sequence(
-                events
-            )
-        )
-
-        sequence_results.append(
-            {
-                "name": test_name,
-                "sequence": ", ".join(events),
-                "result": (
-                    "Accepted"
-                    if is_valid
-                    else "Rejected"
-                ),
-                "expected": (
-                    "Accepted"
-                    if expected_valid
-                    else "Rejected"
-                ),
-                "message": message,
-                "valid": is_valid,
-                "expected_valid": expected_valid,
-                "test_passed": is_valid == expected_valid
-            }
-        )
-
-
-    accepted_count = sum(
-        1
-        for result in sequence_results
-        if result["valid"]
-    )
-
-
-    rejected_count = (
-        len(sequence_results)
-        - accepted_count
-    )
-
-
-    validation_passed_count = sum(
-        1
-        for result in sequence_results
-        if result["test_passed"]
-    )
-
-    validation_failed_count = (
-        len(sequence_results)
-        - validation_passed_count
-    )
-
-    validation_rate = (
-        (validation_passed_count / len(sequence_results)) * 100
-        if sequence_results
-        else 0.0
-    )
-
-    covered_states = set()
-    covered_transitions = set()
-
-    for result in sequence_results:
-        events = [
-            event.strip()
-            for event in result["sequence"].split(",")
-            if event.strip()
-        ]
-        states_seen, transitions_seen = get_sequence_trace(
-            fsm,
-            events
-        )
-        covered_states.update(states_seen)
-        covered_transitions.update(transitions_seen)
-
-    reachable_state_count = len(reachable)
-    state_coverage = (
-        (len(covered_states & reachable) / reachable_state_count) * 100
-        if reachable_state_count
-        else 0.0
-    )
-
-    transition_count = len(actual_transitions)
-    transition_coverage = (
-        (len(covered_transitions & set(actual_transitions)) / transition_count) * 100
-        if transition_count
-        else 0.0
-    )
-
-
-    # =====================================================
-    # 11. STORE RESULTS
-    # =====================================================
-
-    st.session_state["fsm"] = fsm
-
-    st.session_state["transitions"] = (
-        actual_transitions
-    )
-
-    st.session_state["requirements"] = (
-        requirements
-    )
-
-    st.session_state["extracted_requirements"] = (
-        extracted_requirements
-    )
-
-    st.session_state["traceability"] = (
-        traceability
-    )
-
-    st.session_state["reachable"] = (
-        reachable
-    )
-
-    st.session_state["unreachable"] = (
-        unreachable
-    )
-
-    st.session_state["dead_ends"] = (
-        dead_ends
-    )
-
-    st.session_state["consistency_issues"] = (
-        consistency_issues
-    )
-
-    st.session_state["recommendations"] = (
-        recommendations
-    )
-
-    st.session_state["total_issues"] = (
-        total_issues
-    )
-
-    st.session_state["sequence_results"] = (
-        sequence_results
-    )
-
-    st.session_state["accepted_count"] = (
-        accepted_count
-    )
-
-    st.session_state["rejected_count"] = (
-        rejected_count
-    )
-
-    st.session_state["validation_passed_count"] = (
-        validation_passed_count
-    )
-
-    st.session_state["validation_failed_count"] = (
-        validation_failed_count
-    )
-
-    st.session_state["validation_rate"] = (
-        validation_rate
-    )
-
-    st.session_state["covered_states"] = (
-        covered_states
-    )
-
-    st.session_state["covered_transitions"] = (
-        covered_transitions
-    )
-
-    st.session_state["state_coverage"] = (
-        state_coverage
-    )
-
-    st.session_state["transition_coverage"] = (
-        transition_coverage
-    )
-
-    st.session_state["analyzed"] = True
-
-
-    # =====================================================
-    # 12. GENERATE REPORT
-    # =====================================================
-
-    report_lines = []
-
-    report_lines.append(
-        "REQVERIFY AI"
-    )
-
-    report_lines.append(
-        "Intelligent Software Requirement Consistency "
-        "and Workflow Verification System"
-    )
-
-    report_lines.append(
-        "=" * 70
-    )
-
-    report_lines.append("")
-
-    report_lines.append(
-        "Analysis Date: "
-        + datetime.now().strftime(
-            "%d-%m-%Y %H:%M:%S"
-        )
-    )
-
-    report_lines.append("")
-
-
-    report_lines.append(
-        "1. INPUT SOFTWARE REQUIREMENTS"
-    )
-
-    report_lines.append(
-        "-" * 70
-    )
-
-    report_lines.append(
-        requirements
-    )
-
-    report_lines.append("")
-
-
-    report_lines.append(
-        "2. EXTRACTED FUNCTIONAL REQUIREMENTS"
-    )
-
-    report_lines.append(
-        "-" * 70
-    )
-
-    for index, requirement in enumerate(
-        extracted_requirements,
-        start=1
-    ):
-
-        report_lines.append(
-            f"FR{index}: "
-            + requirement["description"]
-        )
-
-    report_lines.append("")
-
-
-    report_lines.append(
-        "3. REQUIREMENT TO FSM TRACEABILITY"
-    )
-
-    report_lines.append(
-        "-" * 70
+    # ------------------------------------------------------
+    # 9. TRACEABILITY
+    # ------------------------------------------------------
+
+    st.subheader(
+        "Requirement → FSM Traceability"
     )
 
     for item in traceability:
 
-        report_lines.append(
-            f"{item['id']}: {item['requirement']}"
-        )
+        if item["transition"]:
 
-        if item["transitions"]:
-            for transition in item["transitions"]:
-                report_lines.append(
-                    "  " + transition
-                )
-        else:
-            report_lines.append(
-                "  No direct FSM transition mapped."
+            source, event, target = (
+                item["transition"]
             )
 
-    report_lines.append("")
-
-
-    report_lines.append(
-        "4. EXTRACTED FSM WORKFLOW"
-    )
-
-    report_lines.append(
-        "-" * 70
-    )
-
-    for from_state, event, to_state in actual_transitions:
-
-        report_lines.append(
-            f"{from_state} --{event}--> {to_state}"
-        )
-
-    report_lines.append("")
-
-
-    report_lines.append(
-        "5. FSM STATE INFORMATION"
-    )
-
-    report_lines.append(
-        "-" * 70
-    )
-
-    report_lines.append(
-        "All States: "
-        + ", ".join(
-            sorted(fsm.states)
-        )
-    )
-
-    report_lines.append(
-        "Reachable States: "
-        + ", ".join(
-            sorted(reachable)
-        )
-    )
-
-    report_lines.append(
-        "Unreachable States: "
-        + (
-            ", ".join(
-                sorted(unreachable)
+            st.write(
+                f"**{item['id']} — "
+                f"{item['title']}**  "
+                f"→ `{source} --{event}--> {target}`"
             )
-            if unreachable
-            else "None"
-        )
-    )
-
-    report_lines.append(
-        "Dead-end States: "
-        + (
-            ", ".join(
-                sorted(dead_ends)
-            )
-            if dead_ends
-            else "None"
-        )
-    )
-
-    report_lines.append("")
-
-
-    report_lines.append(
-        "6. REQUIREMENT CONSISTENCY"
-    )
-
-    report_lines.append(
-        "-" * 70
-    )
-
-    if consistency_issues:
-
-        for issue in consistency_issues:
-
-            report_lines.append(
-                "ISSUE: " + issue
-            )
-
-    else:
-
-        report_lines.append(
-            "No contradictions detected."
-        )
-
-    report_lines.append("")
-
-
-    report_lines.append(
-        "7. AUTOMATIC SEQUENCE TEST RESULTS"
-    )
-
-    report_lines.append(
-        "-" * 70
-    )
-
-    for result in sequence_results:
-
-        report_lines.append(
-            f"Test: {result['name']}"
-        )
-
-        report_lines.append(
-            f"Sequence: {result['sequence']}"
-        )
-
-        report_lines.append(
-            f"Result: {result['result']}"
-        )
-
-        report_lines.append(
-            f"Explanation: {result['message']}"
-        )
-
-        report_lines.append("")
-
-
-    report_lines.append(
-        "8. EXPERIMENTAL VALIDATION RESULTS"
-    )
-
-    report_lines.append(
-        "-" * 70
-    )
-
-    report_lines.append(
-        f"Total Test Cases: {len(sequence_results)}"
-    )
-
-    report_lines.append(
-        f"Validation Tests Passed: {validation_passed_count}"
-    )
-
-    report_lines.append(
-        f"Validation Tests Failed: {validation_failed_count}"
-    )
-
-    report_lines.append(
-        f"Test Suite Agreement: {validation_rate:.1f}%"
-    )
-
-    report_lines.append(
-        f"FSM State Coverage: {state_coverage:.1f}%"
-    )
-
-    report_lines.append(
-        f"FSM Transition Coverage: {transition_coverage:.1f}%"
-    )
-
-    report_lines.append("")
-
-    for result in sequence_results:
-        report_lines.append(
-            f"{result['name']}: Expected={result['expected']}, "
-            f"Actual={result['result']}, "
-            f"Validation={'PASS' if result['test_passed'] else 'FAIL'}"
-        )
-
-    report_lines.append("")
-
-
-    report_lines.append(
-        "9. OVERALL VERIFICATION RESULT"
-    )
-
-    report_lines.append(
-        "-" * 70
-    )
-
-    if total_issues == 0:
-
-        report_lines.append(
-            "VERIFICATION PASSED"
-        )
-
-    else:
-
-        report_lines.append(
-            f"VERIFICATION ISSUES DETECTED: "
-            f"{total_issues}"
-        )
-
-    report_lines.append("")
-
-
-    report_lines.append(
-        "10. EXPLAINABLE RECOMMENDATIONS"
-    )
-
-    report_lines.append(
-        "-" * 70
-    )
-
-    if recommendations:
-
-        for index, recommendation in enumerate(
-            recommendations,
-            start=1
-        ):
-
-            report_lines.append(
-                f"{index}. {recommendation}"
-            )
-
-    else:
-
-        report_lines.append(
-            "No corrective recommendations required."
-        )
-
-    report_lines.append("")
-
-    report_lines.append(
-        "=" * 70
-    )
-
-    report_lines.append(
-        "Generated by ReqVerify AI"
-    )
-
-
-    st.session_state["verification_report"] = (
-        "\n".join(report_lines)
-    )
-
-
-# =========================================================
-# DISPLAY RESULTS
-# =========================================================
-
-if st.session_state.get(
-    "analyzed",
-    False
-):
-
-    fsm = st.session_state["fsm"]
-
-    transitions = st.session_state[
-        "transitions"
-    ]
-
-    extracted_requirements = (
-        st.session_state[
-            "extracted_requirements"
-        ]
-    )
-
-    traceability = st.session_state["traceability"]
-
-    reachable = st.session_state[
-        "reachable"
-    ]
-
-    unreachable = st.session_state[
-        "unreachable"
-    ]
-
-    dead_ends = st.session_state[
-        "dead_ends"
-    ]
-
-    consistency_issues = (
-        st.session_state[
-            "consistency_issues"
-        ]
-    )
-
-    recommendations = (
-        st.session_state[
-            "recommendations"
-        ]
-    )
-
-    total_issues = (
-        st.session_state[
-            "total_issues"
-        ]
-    )
-
-    sequence_results = (
-        st.session_state[
-            "sequence_results"
-        ]
-    )
-
-    accepted_count = (
-        st.session_state[
-            "accepted_count"
-        ]
-    )
-
-    rejected_count = (
-        st.session_state[
-            "rejected_count"
-        ]
-    )
-
-    verification_report = (
-        st.session_state[
-            "verification_report"
-        ]
-    )
-
-
-    # =====================================================
-    # DASHBOARD
-    # =====================================================
-
-    st.divider()
-
-    st.header(
-        "📊 Verification Dashboard"
-    )
-
-
-    col1, col2, col3, col4 = st.columns(4)
-
-
-    with col1:
-
-        st.metric(
-            "Functional Requirements",
-            len(extracted_requirements)
-        )
-
-
-    with col2:
-
-        st.metric(
-            "FSM States",
-            len(fsm.states)
-        )
-
-
-    with col3:
-
-        st.metric(
-            "FSM Transitions",
-            len(transitions)
-        )
-
-
-    with col4:
-
-        st.metric(
-            "Verification Issues",
-            total_issues
-        )
-
-
-    if total_issues == 0:
-
-        st.success(
-            "🟢 SYSTEM STATUS: VERIFICATION PASSED"
-        )
-
-    else:
-
-        st.error(
-            "🔴 SYSTEM STATUS: ISSUES DETECTED"
-        )
-
-    # -----------------------------------------------------
-    # VERIFICATION MODE INDICATOR
-    # -----------------------------------------------------
-
-    if demo_mode:
-
-        st.warning(
-            "🧪 VERIFICATION TEST MODE ACTIVE — "
-            "Artificial workflow defects have been injected "
-            "to demonstrate formal verification."
-        )
-
-    else:
-
-        st.info(
-            "✅ NORMAL VERIFICATION MODE — "
-            "The FSM is generated directly from the supplied requirements."
-        )
-
-
-    # =====================================================
-    # EXTRACTED REQUIREMENTS
-    # =====================================================
-
-    st.header(
-        "1. Extracted Functional Requirements"
-    )
-
-
-    if extracted_requirements:
-
-        for index, requirement in enumerate(
-            extracted_requirements,
-            start=1
-        ):
-
-            with st.expander(
-                f"FR{index} — "
-                f"{requirement['type']}"
-            ):
-
-                st.write(
-                    requirement["description"]
-                )
-
-    else:
-
-        st.warning(
-            "No functional requirements identified."
-        )
-
-
-    # =====================================================
-    # REQUIREMENT → FSM TRACEABILITY
-    # =====================================================
-
-    st.header(
-        "2. Requirement → FSM Traceability"
-    )
-
-    st.write(
-        "This mapping shows how each extracted functional requirement "
-        "contributes to the generated FSM workflow."
-    )
-
-    for item in st.session_state["traceability"]:
-
-        st.write(
-            f"**{item['id']} — {item['requirement']}**"
-        )
-
-        if item["transitions"]:
-
-            st.write("**Generated FSM transition(s):**")
-
-            for transition in item["transitions"]:
-
-                st.code(transition)
 
         else:
 
-            st.caption(
-                "No direct FSM transition mapped to this requirement."
+            st.write(
+                f"**{item['id']} — "
+                f"{item['title']}**  "
+                f"→ {item['status']}"
             )
 
-
-    # =====================================================
-    # WORKFLOW
-    # =====================================================
-
-    st.header(
-        "3. Extracted Workflow"
-    )
-
-
-    for from_state, event, to_state in transitions:
-
-        st.write(
-            f"**{from_state}** "
-            f"── `{event}` ──> "
-            f"**{to_state}**"
-        )
-
-
-    # =====================================================
-    # FORMAL VERIFICATION
-    # =====================================================
+    # ------------------------------------------------------
+    # 10. FORMAL VERIFICATION
+    # ------------------------------------------------------
 
     st.header(
-        "4. Formal Verification Results"
+        "3. Formal Verification"
     )
 
-
-    col1, col2, col3, col4 = st.columns(4)
-
-
-    with col1:
-
-        st.metric(
-            "Total States",
-            len(fsm.states)
-        )
-
-
-    with col2:
-
-        st.metric(
-            "Reachable",
-            len(reachable)
-        )
-
-
-    with col3:
-
-        st.metric(
-            "Unreachable",
-            len(unreachable)
-        )
-
-
-    with col4:
-
-        st.metric(
-            "Dead-end",
-            len(dead_ends)
-        )
-
-
-    if unreachable:
-
-        st.error(
-            "⚠ Unreachable States: "
-            + ", ".join(
-                sorted(unreachable)
-            )
-        )
-
-    else:
+    if not unreachable:
 
         st.success(
-            "✓ All states are reachable from START."
-        )
-
-
-    if dead_ends:
-
-        st.warning(
-            "⚠ Dead-end States: "
-            + ", ".join(
-                sorted(dead_ends)
-            )
-        )
-
-    else:
-
-        st.success(
-            "✓ No dead-end states detected."
-        )
-
-
-    # =====================================================
-    # CONSISTENCY
-    # =====================================================
-
-    st.header(
-        "5. Requirement Consistency"
-    )
-
-
-    if consistency_issues:
-
-        st.error(
-            "⚠ Requirement inconsistencies detected."
-        )
-
-        for issue in consistency_issues:
-
-            st.warning(
-                issue
-            )
-
-    else:
-
-        st.success(
-            "✓ No contradictions detected "
-            "in the supported consistency checks."
-        )
-
-
-    # =====================================================
-    # OVERALL RESULT
-    # =====================================================
-
-    st.header(
-        "Overall Verification Result"
-    )
-
-
-    if total_issues == 0:
-
-        st.success(
-            "✓ VERIFICATION PASSED — "
-            "No structural or consistency issues detected."
+            "✓ No unreachable states detected."
         )
 
     else:
 
         st.error(
-            f"⚠ VERIFICATION ISSUES DETECTED — "
-            f"{total_issues} issue(s) found."
+            "✗ Unreachable states detected."
         )
 
-
-    # =====================================================
-    # RECOMMENDATIONS
-    # =====================================================
-
-    st.header(
-        "Explainable Recommendations"
-    )
-
-
-    if recommendations:
-
-        for index, recommendation in enumerate(
-            recommendations,
-            start=1
+        for state in sorted(
+            unreachable
         ):
 
-            st.info(
-                f"Recommendation {index}: "
-                f"{recommendation}"
+            st.write(
+                f"- `{state}` cannot be "
+                "reached from START."
             )
 
+    if not dead_ends:
+
+        st.success(
+            "✓ No non-final dead-end states detected."
+        )
+
     else:
+
+        st.error(
+            "✗ Dead-end states detected."
+        )
+
+        for state in sorted(
+            dead_ends
+        ):
+
+            st.write(
+                f"- `{state}` has no outgoing "
+                "transition and is not final."
+            )
+
+    if not consistency_issues:
+
+        st.success(
+            "✓ No potential contradictions "
+            "detected by the consistency rules."
+        )
+
+    else:
+
+        st.warning(
+            "Potential requirement contradictions "
+            "were detected."
+        )
+
+        for issue in (
+            consistency_issues
+        ):
+
+            st.write(
+                f"- {issue['message']}"
+            )
+
+    # ------------------------------------------------------
+    # 11. RECOMMENDATIONS
+    # ------------------------------------------------------
+
+    st.header(
+        "4. Recommendations"
+    )
+
+    recommendations = []
+
+    for state in sorted(
+        unreachable
+    ):
+
+        recommendations.append(
+            f"Review state '{state}'. "
+            "It cannot be reached from START. "
+            "Add an appropriate transition or "
+            "remove it if it is not part of the "
+            "intended workflow."
+        )
+
+    for state in sorted(
+        dead_ends
+    ):
+
+        recommendations.append(
+            f"Review state '{state}'. "
+            "It is reachable but has no outgoing "
+            "transition and is not marked final."
+        )
+
+    for issue in (
+        consistency_issues
+    ):
+
+        recommendations.append(
+            issue["message"]
+        )
+
+    if not recommendations:
 
         st.success(
             "No corrective recommendations are required."
         )
 
+    else:
 
-    # =====================================================
-    # SEQUENCE VALIDATION
-    # =====================================================
+        for recommendation in (
+            recommendations
+        ):
+
+            st.write(
+                "• " + recommendation
+            )
+
+    # ------------------------------------------------------
+    # 12. FSM VISUALIZATION
+    # ------------------------------------------------------
+
+    st.header(
+        "5. FSM Visualization"
+    )
+
+    draw_fsm(
+        fsm
+    )
+
+    # ------------------------------------------------------
+    # 13. SEQUENCE VALIDATION
+    # ------------------------------------------------------
 
     st.header(
         "6. Sequence Validation"
     )
 
-    st.write(
-        "A sequence represents a series of events "
-        "provided to the generated Finite State Machine."
+    valid_sequence = (
+        get_valid_sequence(
+            fsm
+        )
     )
 
+    if valid_sequence:
 
-    # =====================================================
-    # MANUAL TEST
-    # =====================================================
+        st.write(
+            "Generated valid event sequence:"
+        )
 
-    st.subheader(
-        "Manual Sequence Test"
-    )
-
-
-    sequence_input = st.text_input(
-        "Enter events separated by commas",
-        value=(
-            "login, success, add_item, "
-            "checkout, success"
-        ),
-        key="sequence_input"
-    )
-
-
-    if st.button(
-        "Validate Sequence",
-        key="validate_sequence"
-    ):
-
-        events = [
-
-            event.strip()
-
-            for event in sequence_input.split(",")
-
-            if event.strip()
-
-        ]
-
-
-        is_valid, message = (
-            fsm.check_sequence(
-                events
+        st.code(
+            " → ".join(
+                valid_sequence
             )
         )
 
+        is_valid = (
+            fsm.check_sequence(
+                valid_sequence
+            )
+        )
 
         if is_valid:
 
             st.success(
-                "✓ " + message
+                "✓ Sequence accepted by the FSM."
             )
 
         else:
 
             st.error(
-                "✗ " + message
+                "✗ Generated sequence was rejected."
             )
 
-
-    # =====================================================
-    # AUTOMATIC TESTS
-    # =====================================================
-
-    st.subheader(
-        "Automatic Sequence Test Cases"
-    )
-
-
-    seq_col1, seq_col2 = st.columns(2)
-
-
-    with seq_col1:
-
-        st.metric(
-            "Accepted",
-            accepted_count
-        )
-
-
-    with seq_col2:
-
-        st.metric(
-            "Rejected",
-            rejected_count
-        )
-
-
-    for result in sequence_results:
-
-        if result["valid"]:
-
-            status = "✅ Accepted"
-
-        else:
-
-            status = "❌ Rejected"
-
-
-        with st.expander(
-            f"{status} — {result['name']}"
-        ):
-
-            st.write(
-                "**Input Sequence:**"
-            )
-
-            st.code(
-                result["sequence"]
-            )
-
-            st.write(
-                "**Result:** "
-                + result["result"]
-            )
-
-            st.write(
-                "**Explanation:** "
-                + result["message"]
-            )
-
-
-    # =====================================================
-    # EXPERIMENTAL VALIDATION DASHBOARD
-    # =====================================================
-
-    st.header(
-        "7. Experimental Validation Dashboard"
-    )
-
-    st.caption(
-        "These metrics evaluate whether the implemented FSM behaves as expected "
-        "for the predefined validation scenarios. Acceptance/rejection counts "
-        "describe test inputs and are not software quality scores."
-    )
-
-    val_col1, val_col2, val_col3, val_col4 = st.columns(4)
-
-    with val_col1:
-        st.metric(
-            "Total Test Cases",
-            len(sequence_results)
-        )
-
-    with val_col2:
-        st.metric(
-            "Validation Passed",
-            st.session_state["validation_passed_count"]
-        )
-
-    with val_col3:
-        st.metric(
-            "Validation Failed",
-            st.session_state["validation_failed_count"]
-        )
-
-    with val_col4:
-        st.metric(
-            "Test Suite Agreement",
-            f"{st.session_state['validation_rate']:.1f}%"
-        )
-
-    cov_col1, cov_col2 = st.columns(2)
-
-    with cov_col1:
-        st.metric(
-            "FSM State Coverage",
-            f"{st.session_state['state_coverage']:.1f}%"
-        )
-
-    with cov_col2:
-        st.metric(
-            "FSM Transition Coverage",
-            f"{st.session_state['transition_coverage']:.1f}%"
-        )
-
-    validation_table = []
-
-    for result in sequence_results:
-        validation_table.append(
-            {
-                "Test Case": result["name"],
-                "Expected": result["expected"],
-                "Actual": result["result"],
-                "Validation": (
-                    "PASS"
-                    if result["test_passed"]
-                    else "FAIL"
-                )
-            }
-        )
-
-    st.dataframe(
-        validation_table,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    chart_col1, chart_col2 = st.columns(2)
-
-    with chart_col1:
-        fig_validation, ax_validation = plt.subplots(
-            figsize=(6, 4)
-        )
-
-        ax_validation.bar(
-            ["Passed", "Failed"],
-            [
-                st.session_state["validation_passed_count"],
-                st.session_state["validation_failed_count"]
-            ]
-        )
-
-        ax_validation.set_title(
-            "Validation Test Results"
-        )
-        ax_validation.set_ylabel(
-            "Number of Test Cases"
-        )
-
-        st.pyplot(
-            fig_validation
-        )
-        plt.close(fig_validation)
-
-    with chart_col2:
-        fig_coverage, ax_coverage = plt.subplots(
-            figsize=(6, 4)
-        )
-
-        ax_coverage.bar(
-            ["States", "Transitions"],
-            [
-                st.session_state["state_coverage"],
-                st.session_state["transition_coverage"]
-            ]
-        )
-
-        ax_coverage.set_title(
-            "FSM Coverage"
-        )
-        ax_coverage.set_ylabel(
-            "Coverage (%)"
-        )
-        ax_coverage.set_ylim(0, 100)
-
-        st.pyplot(
-            fig_coverage
-        )
-        plt.close(fig_coverage)
-
-
-    # =====================================================
-    # STATE DIAGRAM
-    # =====================================================
-
-    st.header(
-        "8. Workflow State Diagram"
-    )
-
-
-    graph = nx.DiGraph()
-
-
-    # Add states
-
-    for state in fsm.states:
-
-        graph.add_node(
-            state
-        )
-
-
-    # Add actual FSM transitions
-
-    for from_state, event, to_state in transitions:
-
-        graph.add_edge(
-            from_state,
-            to_state,
-            label=event
-        )
-
-
-    # -----------------------------------------------------
-    # FIXED POSITIONS
-    # -----------------------------------------------------
-
-    positions = {
-
-        "START": (0, 0),
-
-        "LOGIN": (2, 0),
-
-        "DASHBOARD": (4, 0),
-
-        "CART": (6, 0),
-
-        "PAYMENT": (8, 0),
-
-        "ORDER_CONFIRMED": (10, 1),
-
-        "RETRY_PAYMENT": (8, -2),
-
-        "PROCESSING": (10, -2),
-
-        "REFUND_APPROVED": (10, 3)
-
-    }
-
-
-    # Any unexpected states get an automatic position.
-
-    extra_index = 0
-
-
-    for state in graph.nodes:
-
-        if state not in positions:
-
-            positions[state] = (
-                2 + extra_index,
-                -4
-            )
-
-            extra_index += 1
-
-
-    pos = {
-        state: positions[state]
-        for state in graph.nodes
-    }
-
-
-    # -----------------------------------------------------
-    # DETERMINE NODE CATEGORIES
-    # -----------------------------------------------------
-
-    normal_nodes = []
-
-    final_nodes = []
-
-    unreachable_nodes = []
-
-    dead_end_nodes = []
-
-
-    for state in graph.nodes:
-
-        if state in unreachable:
-
-            unreachable_nodes.append(
-                state
-            )
-
-        elif (
-            state in dead_ends
-            and state not in fsm.final_states
-        ):
-
-            dead_end_nodes.append(
-                state
-            )
-
-        elif state in fsm.final_states:
-
-            final_nodes.append(
-                state
-            )
-
-        else:
-
-            normal_nodes.append(
-                state
-            )
-
-
-    # -----------------------------------------------------
-    # DRAW GRAPH
-    # -----------------------------------------------------
-
-    fig, ax = plt.subplots(
-        figsize=(16, 8)
-    )
-
-
-    # Normal states
-
-    if normal_nodes:
-
-        nx.draw_networkx_nodes(
-            graph,
-            pos,
-            nodelist=normal_nodes,
-            node_size=3000,
-            ax=ax
-        )
-
-
-    # Final states
-
-    if final_nodes:
-
-        nx.draw_networkx_nodes(
-            graph,
-            pos,
-            nodelist=final_nodes,
-            node_size=3500,
-            node_shape="s",
-            ax=ax
-        )
-
-
-    # Unreachable states
-
-    if unreachable_nodes:
-
-        nx.draw_networkx_nodes(
-            graph,
-            pos,
-            nodelist=unreachable_nodes,
-            node_size=3500,
-            node_shape="X",
-            ax=ax
-        )
-
-
-    # Dead-end states
-
-    if dead_end_nodes:
-
-        nx.draw_networkx_nodes(
-            graph,
-            pos,
-            nodelist=dead_end_nodes,
-            node_size=3500,
-            node_shape="D",
-            ax=ax
-        )
-
-
-    # Edges
-
-    nx.draw_networkx_edges(
-        graph,
-        pos,
-        arrows=True,
-        arrowsize=20,
-        width=1.8,
-        ax=ax
-    )
-
-
-    # Labels
-
-    nx.draw_networkx_labels(
-        graph,
-        pos,
-        font_size=9,
-        font_weight="bold",
-        ax=ax
-    )
-
-
-    # Edge labels
-
-    edge_labels = (
-        nx.get_edge_attributes(
-            graph,
-            "label"
-        )
-    )
-
-
-    nx.draw_networkx_edge_labels(
-        graph,
-        pos,
-        edge_labels=edge_labels,
-        font_size=8,
-        ax=ax
-    )
-
-
-    ax.set_title(
-        "ReqVerify AI — Generated Finite State Machine",
-        fontsize=15,
-        fontweight="bold"
-    )
-
-
-    ax.axis("off")
-
-
-    st.pyplot(
-        fig
-    )
-
-    plt.close(fig)
-
-
-    # =====================================================
-    # DIAGRAM LEGEND
-    # =====================================================
-
-    st.markdown(
-        """
-        **Diagram Legend**
-
-        - **Circle** → Normal workflow state
-        - **Square** → Final/accepting state
-        - **X** → Unreachable state
-        - **Diamond** → Dead-end state
-        """
-    )
-
-
-    # =====================================================
-    # FINAL VERIFICATION SUMMARY
-    # =====================================================
-
-    st.header(
-        "Final Verification Summary"
-    )
-
-    summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
-
-    with summary_col1:
-        st.metric(
-            "Requirements Analyzed",
-            len(extracted_requirements)
-        )
-
-    with summary_col2:
-        st.metric(
-            "FSM States",
-            len(fsm.states)
-        )
-
-    with summary_col3:
-        st.metric(
-            "FSM Transitions",
-            len(transitions)
-        )
-
-    with summary_col4:
-        st.metric(
-            "Structural Issues",
-            len(unreachable) + len(dead_ends)
-        )
-
-    summary_col5, summary_col6, summary_col7, summary_col8 = st.columns(4)
-
-    with summary_col5:
-        st.metric(
-            "Consistency Issues",
-            len(consistency_issues)
-        )
-
-    with summary_col6:
-        st.metric(
-            "Validation Passed",
-            st.session_state["validation_passed_count"]
-        )
-
-    with summary_col7:
-        st.metric(
-            "Validation Failed",
-            st.session_state["validation_failed_count"]
-        )
-
-    with summary_col8:
-        st.metric(
-            "Test Suite Agreement",
-            f"{st.session_state['validation_rate']:.1f}%"
-        )
-
-    st.markdown(
-        f"""
-        **FSM Coverage**
-
-        - State Coverage: **{st.session_state['state_coverage']:.1f}%**
-        - Transition Coverage: **{st.session_state['transition_coverage']:.1f}%**
-        """
-    )
-
-    if total_issues == 0:
-        st.success(
-            "✓ FINAL RESULT: The supplied requirements produced an FSM "
-            "with no detected structural or supported consistency issues."
-        )
     else:
-        st.warning(
-            f"⚠ FINAL RESULT: {total_issues} verification issue(s) "
-            "were detected and explained above."
+
+        st.info(
+            "No complete path from START "
+            "to a final state was found."
         )
 
-    # =====================================================
-    # VERIFICATION REPORT
-    # =====================================================
+    # ------------------------------------------------------
+    # 14. DOWNLOAD REPORT
+    # ------------------------------------------------------
 
     st.header(
-        "9. Verification Report"
+        "7. Verification Report"
     )
 
+    report = build_report(
+        extracted_requirements,
+        fsm,
+        unreachable,
+        dead_ends,
+        consistency_issues,
+        traceability,
+    )
 
     st.download_button(
-        label="⬇ Download Verification Report",
-        data=verification_report,
-        file_name="ReqVerify_Verification_Report.txt",
+        "📄 Download Verification Report",
+        data=report,
+        file_name="ReqVerifyAI_Verification_Report.txt",
         mime="text/plain",
-        key="download_report"
-    )
-
-
-    st.success(
-        "Analysis completed successfully."
     )
